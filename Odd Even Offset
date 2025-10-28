@@ -1,0 +1,137 @@
+import bpy
+import bmesh
+import random
+from mathutils import Vector, Matrix
+
+# -----------------------
+# User parameters
+cell_size = 1.0        # thickness of each square pipe (units)
+padding = 0.0          # extra margin inside bounding box (units)
+seed = 42              # random seed (change for different spaghetti)
+make_hollow_hint = False  # just a flag, code below does not hollow automatically
+# -----------------------
+
+random.seed(seed)
+
+# Get active object (must be a mesh)
+obj = bpy.context.active_object
+if obj is None or obj.type != 'MESH':
+    raise RuntimeError("Select a mesh object (the bounding volume) before running.")
+
+# Compute bounding box size in world space
+# Use object.dimensions which is in object local space but already scaled
+bbox_size = Vector(obj.dimensions)
+if bbox_size.x <= 0 or bbox_size.y <= 0 or bbox_size.z <= 0:
+    raise RuntimeError("Bounding object has invalid dimensions.")
+
+# Compute grid counts (number of grid cells along each axis)
+# We'll ensure counts are odd so we can use the "odd-cells = passages, even-cells = walls" technique
+def make_odd(n):
+    n = int(n)
+    if n < 3:
+        return 3
+    return n if n % 2 == 1 else n - 1
+
+nx = make_odd((bbox_size.x - 2*padding) // cell_size)
+ny = make_odd((bbox_size.y - 2*padding) // cell_size)
+nz = make_odd((bbox_size.z - 2*padding) // cell_size)
+
+if nx < 3 or ny < 3 or nz < 3:
+    raise RuntimeError("Bounding object is too small for the requested cell_size and padding.")
+
+# Compute origin (lower-left-back corner) of grid in world space
+# We'll center the grid inside the object's bounding box (using object location and dimensions).
+world_center = obj.matrix_world @ Vector((0.0, 0.0, 0.0))
+# Use bbox extents: place origin such that grid is centered in bounding box
+grid_total = Vector((nx * cell_size, ny * cell_size, nz * cell_size))
+origin = world_center - (grid_total / 2.0)
+
+# 3D grid representation: False = wall, True = passage
+grid = [[[False for _ in range(nz)] for _ in range(ny)] for _ in range(nx)]
+
+# Helper: neighbors for 3D DFS maze (two-step neighbors: +/-2)
+dirs = [(2,0,0), (-2,0,0), (0,2,0), (0,-2,0), (0,0,2), (0,0,-2)]
+
+def in_bounds(x,y,z):
+    return 0 <= x < nx and 0 <= y < ny and 0 <= z < nz
+
+# Start at a random odd coordinate (we'll ensure start indices are odd)
+def random_odd_index(max_n):
+    # valid odd indices: 0..max_n-1 but we want odd indices as passages
+    # ensure within 1..max_n-2 and odd
+    candidates = [i for i in range(1, max_n-1) if i % 2 == 1]
+    return random.choice(candidates)
+
+start = (random_odd_index(nx), random_odd_index(ny), random_odd_index(nz))
+
+# Carve passages with iterative DFS
+stack = [start]
+grid[start[0]][start[1]][start[2]] = True
+
+while stack:
+    x,y,z = stack[-1]
+    # shuffle directions
+    nbrs = dirs[:]
+    random.shuffle(nbrs)
+    carved = False
+    for dx,dy,dz in nbrs:
+        nx2 = x + dx
+        ny2 = y + dy
+        nz2 = z + dz
+        if in_bounds(nx2, ny2, nz2) and not grid[nx2][ny2][nz2]:
+            # mark intermediate cell as passage
+            imx = x + dx//2
+            imy = y + dy//2
+            imz = z + dz//2
+            grid[imx][imy][imz] = True
+            grid[nx2][ny2][nz2] = True
+            stack.append((nx2, ny2, nz2))
+            carved = True
+            break
+    if not carved:
+        stack.pop()
+
+# At this point grid True cells are corridor positions.
+# We'll create a single bmesh and add a cube at each True cell.
+bm = bmesh.new()
+
+# Precompute half-size for cube creation
+half = cell_size / 2.0
+
+# For placement: cell (i,j,k) center in world space:
+def cell_center(i,j,k):
+    # compute center offset for that cell
+    return origin + Vector(((i + 0.5) * cell_size, (j + 0.5) * cell_size, (k + 0.5) * cell_size))
+
+# Create cubes (one per passage cell)
+# Use bmesh.ops.create_cube for each cube and transform it to the cell center
+for i in range(nx):
+    for j in range(ny):
+        for k in range(nz):
+            if grid[i][j][k]:
+                # create cube centered at origin then move
+                M = Matrix.Translation(cell_center(i,j,k))
+                bmesh.ops.create_cube(bm, size=cell_size, matrix=M)
+
+# Optional: fuse overlapping vertices (there shouldn't be overlaps since we left walls between)
+# but merge doubles to clean up geometry
+bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+
+# Create mesh data-block and object
+mesh_data = bpy.data.meshes.new("SpaghettiMazeMesh")
+bm.to_mesh(mesh_data)
+bm.free()
+
+maze_obj = bpy.data.objects.new("SpaghettiMaze", mesh_data)
+bpy.context.collection.objects.link(maze_obj)
+
+# Optionally move the maze object to origin parented to bounding object? We'll leave it as placed.
+# Set shading smooth/auto-smooth if you like
+maze_obj.select_set(True)
+bpy.context.view_layer.objects.active = maze_obj
+
+# Recalculate normals
+mesh_data.normals_split_custom_set_from_vertices([v.normal for v in mesh_data.vertices]) if False else None
+mesh_data.update()
+
+print(f"Generated SpaghettiMaze: grid {nx}x{ny}x{nz}, cell_size={cell_size}")
