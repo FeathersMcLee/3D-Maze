@@ -1,0 +1,114 @@
+import bpy
+import bmesh
+import random
+from mathutils import Vector, Matrix
+
+# -----------------------
+# User parameters
+cell_size = 1.0         # thickness of each square pipe (units)
+padding = 0.0           # margin inside bounding box
+seed = 42               # random seed (change for variation)
+num_walkers = 30        # number of independent spaghetti strands
+turn_chance = 0.3       # chance to turn 90° each step
+# -----------------------
+
+random.seed(seed)
+
+# --- Setup / bounding box ---
+obj = bpy.context.active_object
+if obj is None or obj.type != 'MESH':
+    raise RuntimeError("Select a mesh object (the bounding volume) before running.")
+
+bbox_size = Vector(obj.dimensions)
+if min(bbox_size) <= 0:
+    raise RuntimeError("Bounding object has invalid dimensions.")
+
+nx = int((bbox_size.x - 2*padding) // cell_size)
+ny = int((bbox_size.y - 2*padding) // cell_size)
+nz = int((bbox_size.z - 2*padding) // cell_size)
+
+if nx < 3 or ny < 3 or nz < 3:
+    raise RuntimeError("Bounding object too small for given cell_size/padding.")
+
+world_center = obj.matrix_world @ Vector((0.0, 0.0, 0.0))
+grid_total = Vector((nx * cell_size, ny * cell_size, nz * cell_size))
+origin = world_center - (grid_total / 2.0)
+
+# --- Walker logic ---
+dirs = [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]
+occupied = set()
+cells = []
+
+def in_bounds(x, y, z):
+    return 0 <= x < nx and 0 <= y < ny and 0 <= z < nz
+
+def neighbors(x, y, z):
+    for dx, dy, dz in dirs:
+        yield (x+dx, y+dy, z+dz)
+
+for w in range(num_walkers):
+    x = random.randrange(nx)
+    y = random.randrange(ny)
+    z = random.randrange(nz)
+    direction = random.choice(dirs)
+    dead = False
+
+    while not dead:
+        # mark cell
+        if (x, y, z) not in occupied:
+            occupied.add((x, y, z))
+            cells.append((x, y, z))
+
+        # maybe turn randomly
+        if random.random() < turn_chance:
+            candidates = [d for d in dirs if d != (-direction[0], -direction[1], -direction[2])]
+            direction = random.choice(candidates)
+
+        # try moving forward
+        nx2, ny2, nz2 = x + direction[0], y + direction[1], z + direction[2]
+
+        if in_bounds(nx2, ny2, nz2) and (nx2, ny2, nz2) not in occupied:
+            x, y, z = nx2, ny2, nz2
+            continue
+
+        # if forward blocked, try other directions
+        all_dirs = dirs[:]
+        random.shuffle(all_dirs)
+        moved = False
+        for dx, dy, dz in all_dirs:
+            tx, ty, tz = x + dx, y + dy, z + dz
+            if in_bounds(tx, ty, tz) and (tx, ty, tz) not in occupied:
+                direction = (dx, dy, dz)
+                x, y, z = tx, ty, tz
+                moved = True
+                break
+
+        if not moved:
+            # no available moves — walker is done
+            dead = True
+
+# --- Geometry creation ---
+bm = bmesh.new()
+
+def cell_center(i, j, k):
+    return origin + Vector(((i + 0.5) * cell_size,
+                            (j + 0.5) * cell_size,
+                            (k + 0.5) * cell_size))
+
+for (i, j, k) in cells:
+    M = Matrix.Translation(cell_center(i, j, k))
+    bmesh.ops.create_cube(bm, size=cell_size, matrix=M)
+
+bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+
+mesh_data = bpy.data.meshes.new("WalkerSpaghettiMesh")
+bm.to_mesh(mesh_data)
+bm.free()
+
+walker_obj = bpy.data.objects.new("WalkerSpaghetti", mesh_data)
+bpy.context.collection.objects.link(walker_obj)
+walker_obj.select_set(True)
+bpy.context.view_layer.objects.active = walker_obj
+mesh_data.update()
+
+print(f"Generated WalkerSpaghetti: {len(cells)} cubes, {num_walkers} walkers, cell={cell_size}")
